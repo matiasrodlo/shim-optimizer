@@ -1,0 +1,14 @@
+{
+    "SpatialReference": "orig",
+    "GeneratedBy": [
+        {
+            "Name": "sct_deepseg_sc",
+            "Version": "SCT v6.1"
+        },
+        {
+            "Name": "Manual",
+            "Author": "Julien Cohen-Adad",
+            "Date": "2024-01-15 23:10:53"
+        }
+    ]
+}

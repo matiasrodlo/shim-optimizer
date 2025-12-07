@@ -1,0 +1,21 @@
+2.4.0 2024-01-20
+  - Added manual CSF segmentation (https://github.com/shimming-toolbox/rf-shimming-7t/issues/67)
+  - Added manual SC segmentation (https://github.com/shimming-toolbox/rf-shimming-7t/issues/56)
+2.3.0 2024-01-19
+  - - Replaced image by non-distortion corrected (https://github.com/shimming-toolbox/rf-shimming-7t/issues/58)
+2.2.0 2024-01-17
+  - Added disc labels on the T1w scan
+2.1.2 2024-01-16
+  - Updated the name of this repository (2.1.1 only updated the title of the README)
+2.1.1 2024-01-16
+  - Updated the title of this repository
+2.1.0 2024-01-16
+  - Added cord segmentations with manual corrections (https://github.com/shimming-toolbox/rf-shimming-7t/issues/53)
+  - Listed all co-authors
+2.0.1 2023-12-23
+  - Added intervertebral disc labeling (https://github.com/shimming-toolbox/rf-shimming-7t/issues/20)
+2.0.0 2023-12-22
+  - Fixed mixed TFL maps (https://github.com/shimming-toolbox/rf-shimming-7t/issues/17)
+  - Added MGH site (https://github.com/shimming-toolbox/rf-shimming-7t/issues/16)
+1.0.0 2023-12-21
+  - First release
