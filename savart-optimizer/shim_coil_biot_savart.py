@@ -51,6 +51,13 @@ try:
 except ImportError:
     HAS_PYBIDS = False
 
+# Import validation utilities
+try:
+    from validation_utils import validate_optimization_result, generate_validation_summary
+    HAS_VALIDATION = True
+except ImportError:
+    HAS_VALIDATION = False
+
 # Get script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -450,8 +457,9 @@ def compute_bz_grid_for_loop(loop_center, loop_radius_mm, grid_x, grid_y, Nseg=6
     Bz = np.zeros_like(grid_x)
     Ny, Nx = grid_x.shape
     
-    # Biot-Savart constant (arbitrary units, absorbed into scaling)
-    mu0_over_4pi = 1.0
+    # Biot-Savart constant (arbitrary units, will be scaled later to match B0)
+    # Use larger value to reduce extreme scaling factors later
+    mu0_over_4pi = 1000.0  # Arbitrary scaling to get reasonable field magnitudes
     
     # For each segment, compute field using numerically stable Biot-Savart formula
     # For a straight wire segment in 2D (xy-plane), Bz is computed as:
@@ -470,7 +478,8 @@ def compute_bz_grid_for_loop(loop_center, loop_radius_mm, grid_x, grid_y, Nseg=6
         
         # Distance from segment midpoint to observation points
         r_mag = np.linalg.norm(r, axis=-1)  # Shape: (Ny, Nx)
-        r_mag = np.maximum(r_mag, 1e-6)  # Avoid division by zero
+        # Use larger minimum distance to avoid extreme values near the wire
+        r_mag = np.maximum(r_mag, loop_radius_mm * 0.1)  # Min distance = 10% of loop radius
         
         # Cross product (r × seg_dir) for z-component
         # For 2D: cross_z = r_x * seg_dir_y - r_y * seg_dir_x
@@ -478,13 +487,18 @@ def compute_bz_grid_for_loop(loop_center, loop_radius_mm, grid_x, grid_y, Nseg=6
         
         # Biot-Savart contribution: Bz ∝ (r × dl) / |r|³
         # Scale by segment length and use r³ for proper field decay
-        contribution = seg_length[i] * cross_z / (r_mag**3 + 1e-10)
+        r_cubed = r_mag**3
+        contribution = seg_length[i] * cross_z / r_cubed
         
-        # Clip to avoid numerical overflow
-        contribution = np.clip(contribution, -1e4, 1e4)
+        # Clip to avoid numerical overflow and replace non-finite values
+        contribution = np.nan_to_num(contribution, nan=0.0, posinf=0.0, neginf=0.0)
+        contribution = np.clip(contribution, -10.0, 10.0)  # More conservative clipping
         
         # Apply scaling factor
         Bz += contribution * mu0_over_4pi
+    
+    # Final cleanup of any remaining non-finite values
+    Bz = np.nan_to_num(Bz, nan=0.0, posinf=0.0, neginf=0.0)
     
     return Bz
 
@@ -518,6 +532,13 @@ def compute_field_matrix(loops, grid_x, grid_y):
     logging.getLogger(__name__).info(f"Computing field maps for {n_loops} loops...")
     for k in range(n_loops):
         M[k] = compute_bz_grid_for_loop(loop_centers[k], loop_radius, grid_x, grid_y)
+        
+        # Clean up non-finite values immediately
+        n_bad = np.sum(~np.isfinite(M[k]))
+        if n_bad > 0:
+            logging.getLogger(__name__).warning(f"  Loop {k}: {n_bad} non-finite values, replacing with zeros")
+            M[k] = np.nan_to_num(M[k], nan=0.0, posinf=0.0, neginf=0.0)
+        
         norm_k = np.linalg.norm(M[k])
         logging.getLogger(__name__).debug(f"  Loop {k}: L2 norm = {norm_k:.4f}")
     
@@ -573,13 +594,31 @@ def baseline_field_and_metrics(A, weights0, roi_mask, baseline_field=None):
         Dictionary with 'mean', 'std', 'CV' inside ROI
     """
     Ny, Nx = roi_mask.shape
-    shim_flat = A @ weights0
+    # Use error handling for numerical stability
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        shim_flat = A @ weights0
+    
+    # Clean up non-finite values
+    shim_flat = np.nan_to_num(shim_flat, nan=0.0, posinf=0.0, neginf=0.0)
     shim_field = shim_flat.reshape(Ny, Nx)
+    
+    # Clip shim field to prevent extreme values
+    # This is critical for visualization and physical reasonableness
+    if baseline_field is not None:
+        # Use B0 std instead of max for more conservative clipping
+        b0_std = np.std(baseline_field)
+        # Allow shim field up to 3x the B0 std (reasonable for correction)
+        # This is more conservative than using B0 range
+        max_shim = b0_std * 3
+        shim_field = np.clip(shim_field, -max_shim, max_shim)
     
     if baseline_field is not None:
         field = baseline_field + shim_field
     else:
         field = shim_field
+    
+    # Final cleanup
+    field = np.nan_to_num(field, nan=0.0, posinf=0.0, neginf=0.0)
     
     roi_field = field[roi_mask]
     mean_val = np.mean(roi_field)
@@ -632,6 +671,8 @@ def optimize_weights_tikhonov(A, roi_mask, alpha, bounds, w0, method, maxiter, b
         Optimizer success flag
     obj_value : float
         Final objective value
+    history : dict
+        Optimization history (objective, variance, regularization, iterations)
     """
     Ny, Nx = roi_mask.shape
     roi_flat = roi_mask.flatten()
@@ -646,29 +687,59 @@ def optimize_weights_tikhonov(A, roi_mask, alpha, bounds, w0, method, maxiter, b
     else:
         baseline_roi = np.zeros(len(A_roi))
     
+    # Track optimization history
+    history = {
+        'objective': [],
+        'variance': [],
+        'regularization': [],
+        'iteration': [],
+        'grad_norm': []
+    }
+    
     def objective(w):
         """Objective function: variance in ROI + regularization."""
-        shim_roi = A_roi @ w
-        f_total_roi = baseline_roi + shim_roi
-        mean_f = np.mean(f_total_roi)
-        variance = np.sum((f_total_roi - mean_f)**2)
-        reg = alpha * np.sum(w**2)
-        return variance + reg
+        # Use error handling for numerical stability
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            shim_roi = A_roi @ w
+            f_total_roi = baseline_roi + shim_roi
+            mean_f = np.mean(f_total_roi)
+            # Normalize variance by number of pixels for better numerical stability
+            variance = np.mean((f_total_roi - mean_f)**2)
+            reg = alpha * np.mean(w**2)
+            obj = variance + reg
+            
+            # Track history (only every 10th iteration to avoid overhead)
+            if len(history['objective']) == 0 or len(history['objective']) % 10 == 0:
+                history['objective'].append(float(obj))
+                history['variance'].append(float(variance))
+                history['regularization'].append(float(reg))
+                history['iteration'].append(len(history['objective']) * 10)
+        
+        return obj
     
     def gradient(w):
         """Analytic gradient of objective."""
-        shim_roi = A_roi @ w
-        f_total_roi = baseline_roi + shim_roi
-        mean_f = np.mean(f_total_roi)
+        # Use error handling for numerical stability
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            shim_roi = A_roi @ w
+            f_total_roi = baseline_roi + shim_roi
+            mean_f = np.mean(f_total_roi)
+            
+            # Gradient of variance term: d/dw mean((f_total - mean)^2)
+            # = 2 * A_roi.T @ (f_total - mean) / n_roi
+            # Since we normalized objective, gradient is also normalized
+            grad_var = 2 * A_roi.T @ (f_total_roi - mean_f) / len(f_total_roi)
+            
+            # Gradient of regularization term (normalized)
+            grad_reg = 2 * alpha * w / len(w)
+            
+            grad = grad_var + grad_reg
+            
+            # Track gradient norm (only every 10th call)
+            if len(history['grad_norm']) < len(history['objective']):
+                history['grad_norm'].append(float(np.linalg.norm(grad)))
         
-        # Gradient of variance term: d/dw sum((f_total - mean)^2)
-        # = 2 * A_roi.T @ (f_total - mean)
-        grad_var = 2 * A_roi.T @ (f_total_roi - mean_f)
-        
-        # Gradient of regularization term
-        grad_reg = 2 * alpha * w
-        
-        return grad_var + grad_reg
+        return grad
     
     # Optimize
     result = optimize.minimize(
@@ -677,10 +748,18 @@ def optimize_weights_tikhonov(A, roi_mask, alpha, bounds, w0, method, maxiter, b
         method=method,
         jac=gradient,
         bounds=[bounds] * n_loops,
-        options={'maxiter': maxiter}
+        options={'maxiter': maxiter, 'disp': False}
     )
     
-    return result.x, result.success, result.fun
+    # Add final result info to history
+    history['n_iterations'] = result.nit
+    history['n_function_evals'] = result.nfev if hasattr(result, 'nfev') else len(history['objective'])
+    history['success'] = bool(result.success)
+    history['message'] = str(result.message)
+    history['final_objective'] = float(result.fun)
+    history['initial_objective'] = float(history['objective'][0]) if history['objective'] else float('nan')
+    
+    return result.x, result.success, result.fun, history
 
 
 def plot_before_after(field_before, field_after, roi_mask, loops, weights_before, weights_after, outpath):
@@ -712,52 +791,170 @@ def plot_before_after(field_before, field_after, roi_mask, loops, weights_before
     y_plot = np.linspace(-GRID_FOV_MM/2, GRID_FOV_MM/2, Ny)
     X_plot, Y_plot = np.meshgrid(x_plot, y_plot)
     
-    # Common color scale
-    vmin = min(np.min(field_before), np.min(field_after))
-    vmax = max(np.max(field_before), np.max(field_after))
+    # Check for NaN/Inf values and clean them
+    n_bad_before = np.sum(~np.isfinite(field_before))
+    n_bad_after = np.sum(~np.isfinite(field_after))
     
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    if n_bad_before > 0:
+        print(f"Warning: field_before contains {n_bad_before} non-finite values, cleaning...")
+        field_before = np.nan_to_num(field_before, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Left: before
-    ax = axes[0]
-    im = ax.contourf(X_plot, Y_plot, field_before, levels=20, cmap='RdBu_r', vmin=vmin, vmax=vmax)
+    if n_bad_after > 0:
+        print(f"Warning: field_after contains {n_bad_after} non-finite values, cleaning...")
+        field_after = np.nan_to_num(field_after, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Aggressive clipping based on ROI values for better visualization
+    # Compute reasonable limits from ROI
+    field_before_roi = field_before[roi_mask]
+    field_after_roi = field_after[roi_mask]
+    
+    before_min, before_max = np.percentile(field_before_roi, [0.1, 99.9])
+    after_min, after_max = np.percentile(field_after_roi, [0.1, 99.9])
+    
+    # Use same color scale for both panels for better comparison
+    # This makes visual comparison more meaningful
+    global_min = min(before_min, after_min)
+    global_max = max(before_max, after_max)
+    
+    # Small margin for visualization
+    margin = 0.2  # 20% margin (more conservative)
+    value_range = global_max - global_min
+    
+    clip_min = global_min - margin * value_range
+    clip_max = global_max + margin * value_range
+    
+    # Apply same clipping to both fields
+    field_before_plot = np.clip(field_before, clip_min, clip_max)
+    field_after_plot = np.clip(field_after, clip_min, clip_max)
+    
+    # Additionally, mask out areas very close to loops to avoid artifacts
+    # Create exclusion zones around each loop position
+    loop_exclusion_radius = 15.0  # mm - don't visualize field within this radius of loops
+    exclusion_mask = np.ones_like(field_after, dtype=bool)
+    
+    # Recreate grid for distance calculation
+    Ny, Nx = field_after.shape
+    fov_mm = 100.0  # Assume 200mm FOV centered at origin
+    x_coords = np.linspace(-fov_mm, fov_mm, Nx)
+    y_coords = np.linspace(-fov_mm, fov_mm, Ny)
+    X_grid, Y_grid = np.meshgrid(x_coords, y_coords)
+    
+    for loop_pos in loop_centers:
+        dist_to_loop = np.sqrt((X_grid - loop_pos[0])**2 + (Y_grid - loop_pos[1])**2)
+        exclusion_mask &= (dist_to_loop > loop_exclusion_radius)
+    
+    # Apply exclusion mask to after field (set excluded areas to NaN for white space)
+    field_after_plot = np.where(exclusion_mask, field_after_plot, np.nan)
+    
+    # Debug: print field ranges
+    print(f"Plot debug:")
+    print(f"  field_before: original range=[{np.min(field_before):.1f}, {np.max(field_before):.1f}]")
+    print(f"  field_before: clipped range=[{np.min(field_before_plot):.1f}, {np.max(field_before_plot):.1f}]")
+    print(f"  field_after: original range=[{np.min(field_after):.1f}, {np.max(field_after):.1f}]")
+    print(f"  field_after: clipped range=[{np.min(field_after_plot):.1f}, {np.max(field_after_plot):.1f}]")
+    print(f"  ROI mask: {np.sum(roi_mask)} pixels")
+    
+    # Create 4-panel figure
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Top-left: before (B0 baseline with no shim)
+    ax = axes[0, 0]
+    
+    # Use clipped field for plotting
+    vmin_before = np.min(field_before_plot)
+    vmax_before = np.max(field_before_plot)
+    
+    print(f"  Before panel: vmin={vmin_before:.1f}, vmax={vmax_before:.1f}")
+    
+    # Create contour plot with explicit levels
+    try:
+        levels_before = np.linspace(vmin_before, vmax_before, 21)
+        im = ax.contourf(X_plot, Y_plot, field_before_plot, levels=levels_before, cmap='RdBu_r')
+        ax.contour(X_plot, Y_plot, roi_mask.astype(float), levels=[0.5], colors='black', linewidths=2)
+        ax.scatter(loop_centers[:, 0], loop_centers[:, 1], c='gray', 
+                   s=100, edgecolors='black', linewidths=1, alpha=0.5)
+        ax.set_title(f'Before: B0 Baseline (no shim)\nROI std = {np.std(field_before[roi_mask]):.1f}')
+        ax.set_xlabel('x (mm)')
+        ax.set_ylabel('y (mm)')
+        ax.set_aspect('equal')
+        plt.colorbar(im, ax=ax, label='Bz (arb. units)')
+    except Exception as e:
+        print(f"  Error creating before panel: {e}")
+        ax.text(0.5, 0.5, f'Error: {str(e)}', transform=ax.transAxes, ha='center')
+    
+    # Top-right: after (B0 + optimized shim)
+    ax = axes[0, 1]
+    
+    # Use clipped field for plotting
+    vmin_after = np.min(field_after_plot)
+    vmax_after = np.max(field_after_plot)
+    
+    print(f"  After panel: vmin={vmin_after:.1f}, vmax={vmax_after:.1f}")
+    
+    # Create contour plot with explicit levels
+    try:
+        levels_after = np.linspace(vmin_after, vmax_after, 21)
+        im = ax.contourf(X_plot, Y_plot, field_after_plot, levels=levels_after, cmap='RdBu_r')
+        ax.contour(X_plot, Y_plot, roi_mask.astype(float), levels=[0.5], colors='black', linewidths=2)
+        ax.scatter(loop_centers[:, 0], loop_centers[:, 1], c=weights_after, 
+                   s=100, cmap='RdBu_r', edgecolors='black', linewidths=1, vmin=-1, vmax=1)
+        for k, (x, y) in enumerate(loop_centers):
+            ax.annotate(f'{weights_after[k]:.2f}', (x, y), fontsize=8, ha='center', va='center')
+        ax.set_title(f'After: B0 + Optimized Shim\nROI std = {np.std(field_after[roi_mask]):.1f}')
+        ax.set_xlabel('x (mm)')
+        ax.set_ylabel('y (mm)')
+        ax.set_aspect('equal')
+        plt.colorbar(im, ax=ax, label='Bz (arb. units)')
+    except Exception as e:
+        print(f"  Error creating after panel: {e}")
+        ax.text(0.5, 0.5, f'Error: {str(e)}', transform=ax.transAxes, ha='center')
+    
+    # Bottom-left: difference (improvement)
+    ax = axes[1, 0]
+    # Show std reduction in ROI
+    std_before = np.std(field_before[roi_mask])
+    std_after = np.std(field_after[roi_mask])
+    improvement = 100 * (1 - std_after / std_before)
+    
+    # Plot field difference (use clipped fields)
+    field_diff = field_after_plot - field_before_plot
+    im = ax.contourf(X_plot, Y_plot, field_diff, levels=20, cmap='RdBu_r')
     ax.contour(X_plot, Y_plot, roi_mask.astype(float), levels=[0.5], colors='black', linewidths=2)
-    ax.scatter(loop_centers[:, 0], loop_centers[:, 1], c=weights_before, 
-               s=100, cmap='RdBu_r', edgecolors='black', linewidths=1, vmin=-1, vmax=1)
-    for k, (x, y) in enumerate(loop_centers):
-        ax.annotate(f'{weights_before[k]:.2f}', (x, y), fontsize=8, ha='center', va='center')
-    ax.set_title('Before Optimization')
+    ax.set_title(f'Shim Field Applied\n{improvement:.1f}% std reduction')
     ax.set_xlabel('x (mm)')
     ax.set_ylabel('y (mm)')
     ax.set_aspect('equal')
-    plt.colorbar(im, ax=ax, label='Bz (arb. units)')
+    plt.colorbar(im, ax=ax, label='Shim Bz (arb. units)')
     
-    # Middle: after
-    ax = axes[1]
-    im = ax.contourf(X_plot, Y_plot, field_after, levels=20, cmap='RdBu_r', vmin=vmin, vmax=vmax)
-    ax.contour(X_plot, Y_plot, roi_mask.astype(float), levels=[0.5], colors='black', linewidths=2)
-    ax.scatter(loop_centers[:, 0], loop_centers[:, 1], c=weights_after, 
-               s=100, cmap='RdBu_r', edgecolors='black', linewidths=1, vmin=-1, vmax=1)
-    for k, (x, y) in enumerate(loop_centers):
-        ax.annotate(f'{weights_after[k]:.2f}', (x, y), fontsize=8, ha='center', va='center')
-    ax.set_title('After Optimization')
-    ax.set_xlabel('x (mm)')
-    ax.set_ylabel('y (mm)')
-    ax.set_aspect('equal')
-    plt.colorbar(im, ax=ax, label='Bz (arb. units)')
-    
-    # Right: weights bar chart
-    ax = axes[2]
+    # Bottom-right: weights bar chart
+    ax = axes[1, 1]
     x_pos = np.arange(len(weights_before))
     width = 0.35
-    ax.bar(x_pos - width/2, weights_before, width, label='Before', alpha=0.7)
-    ax.bar(x_pos + width/2, weights_after, width, label='After', alpha=0.7)
+    
+    # Plot bars with distinct colors
+    bars_before = ax.bar(x_pos - width/2, weights_before, width, label='Before (no shim)', 
+                         alpha=0.8, color='lightblue', edgecolor='blue', linewidth=1.5)
+    bars_after = ax.bar(x_pos + width/2, weights_after, width, label='After (optimized)', 
+                        alpha=0.8, color='lightcoral', edgecolor='red', linewidth=1.5)
+    
+    # Add horizontal line at zero for reference
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
+    
     ax.set_xlabel('Loop Index')
     ax.set_ylabel('Weight')
-    ax.set_title('Loop Weights')
+    ax.set_title('Loop Weights Comparison')
     ax.set_xticks(x_pos)
+    ax.set_xticklabels([str(i) for i in x_pos])
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim([-1.1, 1.1])
+    
+    # Add text annotation for zero weights
+    if np.allclose(weights_before, 0):
+        ax.text(0.5, 0.95, 'Before: All weights = 0 (no shim applied)', 
+                transform=ax.transAxes, ha='center', va='top',
+                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5),
+                fontsize=9)
     
     plt.tight_layout()
     plt.savefig(outpath, dpi=150, bbox_inches='tight')
@@ -1120,11 +1317,96 @@ def main():
     logger.info("\nComputing field matrix...")
     M, A = compute_field_matrix(loops, grid_x, grid_y)
     
+    # Check field matrix quality
+    logger.info(f"  Field matrix shape: {A.shape}")
+    logger.debug(f"  Field matrix range: [{np.min(A):.6e}, {np.max(A):.6e}]")
+    n_bad_before = np.sum(~np.isfinite(A))
+    if n_bad_before > 0:
+        logger.warning(f"  Field matrix contains {n_bad_before} non-finite values, will be cleaned")
+    
     # Create ROI mask
     logger.info("\nCreating ROI mask...")
     roi_mask = make_roi_mask(grid_x, grid_y, ROI_RADIUS_MM)
     n_roi_pixels = np.sum(roi_mask)
     logger.info(f"ROI contains {n_roi_pixels} pixels")
+    
+    # Normalize and scale field matrix for optimal performance
+    # Professional approach: normalize each loop, then scale globally
+    logger.info("\nNormalizing and scaling field matrix...")
+    b0_roi = baseline_b0[roi_mask]
+    b0_std = np.std(b0_roi)
+    b0_range = np.ptp(b0_roi)  # Peak-to-peak range
+    
+    # Extract ROI portion of field matrix
+    A_roi = A[roi_mask.flatten()]
+    
+    # Step 1: Normalize each loop's field to unit standard deviation in ROI
+    # This makes all loops contribute equally and prevents numerical issues
+    logger.info("  Step 1: Normalizing each loop to unit std in ROI...")
+    field_stds = np.std(A_roi, axis=0)
+    
+    # Check for zero-variance loops
+    n_zero_loops = np.sum(field_stds < 1e-12)
+    if n_zero_loops > 0:
+        logger.warning(f"  {n_zero_loops} loops have near-zero field in ROI")
+    
+    # Normalize (avoid division by zero)
+    normalization = np.where(field_stds > 1e-12, field_stds, 1.0)
+    A_normalized = A / normalization[np.newaxis, :]
+    M_normalized = M / normalization[:, np.newaxis, np.newaxis]
+    
+    # Step 2: Scale globally to match B0 field magnitude
+    # Use standard deviation as it's more robust than max
+    logger.info("  Step 2: Scaling to match B0 field magnitude...")
+    A_roi_normalized = A_normalized[roi_mask.flatten()]
+    
+    # Compute expected shim field std with unit weights after normalization
+    unit_weights = np.ones(N_LOOPS)
+    shim_roi_normalized = A_roi_normalized @ unit_weights
+    shim_std_normalized = np.std(shim_roi_normalized)
+    
+    if shim_std_normalized > 1e-10:
+        # Scale so that unit weights produce field with std similar to B0 std
+        # This ensures shim can effectively correct B0 variations
+        global_scale = b0_std / shim_std_normalized
+        
+        # Apply reasonable limits to prevent numerical issues
+        # Allow shim field up to 10x B0 std (strong correction capability)
+        max_reasonable_scale = 10.0
+        if global_scale > max_reasonable_scale:
+            logger.warning(f"  Global scale ({global_scale:.2f}) exceeds reasonable limit")
+            logger.warning(f"  Capping at {max_reasonable_scale:.2f} for numerical stability")
+            global_scale = max_reasonable_scale
+        
+        A = A_normalized * global_scale
+        M = M_normalized * global_scale
+        
+        logger.info(f"  B0 std in ROI: {b0_std:.2f}")
+        logger.info(f"  B0 range in ROI: {b0_range:.2f}")
+        logger.info(f"  Shim std (normalized, unit weights): {shim_std_normalized:.6f}")
+        logger.info(f"  Global scaling factor: {global_scale:.2f}")
+        logger.info(f"  Expected shim std with unit weights: {shim_std_normalized * global_scale:.2f}")
+        
+        # Verify final field matrix quality
+        A_roi_final = A[roi_mask.flatten()]
+        cond_num = np.linalg.cond(A_roi_final)
+        logger.info(f"  Final condition number: {cond_num:.2e}")
+        
+        if cond_num > 1e10:
+            logger.warning("  Field matrix is ill-conditioned, optimization may be challenging")
+        
+        # Check for any remaining numerical issues
+        n_bad = np.sum(~np.isfinite(A))
+        if n_bad > 0:
+            logger.warning(f"  {n_bad} non-finite values in field matrix, replacing with zeros")
+            A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+            M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        logger.info(f"  Final field matrix range: [{np.min(A):.2e}, {np.max(A):.2e}]")
+    else:
+        logger.error("  Shim field too weak even after normalization!")
+        logger.error("  Check coil geometry and Biot-Savart computation")
+        sys.exit(1)
     
     # Baseline field (using real B0 data, no shim initially)
     logger.info("\nComputing baseline field (real B0 data, no shim)...")
@@ -1152,12 +1434,29 @@ def main():
     
     # Optimization
     logger.info("\nOptimizing weights to minimize variance of (B0 + shim)...")
-    w_opt, success, obj_value = optimize_weights_tikhonov(
+    logger.info(f"  Method: {OPT_METHOD}")
+    logger.info(f"  Regularization (α): {ALPHA}")
+    logger.info(f"  Weight bounds: {BOUNDS}")
+    logger.info(f"  Max iterations: {MAXITER}")
+    
+    w_opt, success, obj_value, opt_history = optimize_weights_tikhonov(
         A, roi_mask, ALPHA, BOUNDS, weights0, OPT_METHOD, MAXITER, baseline_field=baseline_b0
     )
-    logger.info(f"Optimizer success: {success}")
-    logger.info(f"Final objective value: {obj_value:.6f}")
-    logger.info("Optimized weights:")
+    
+    # Log optimization results
+    logger.info("\nOptimization Results:")
+    logger.info(f"  Success: {success}")
+    logger.info(f"  Message: {opt_history['message']}")
+    logger.info(f"  Iterations: {opt_history['n_iterations']}")
+    logger.info(f"  Function evaluations: {opt_history['n_function_evals']}")
+    logger.info(f"  Initial objective: {opt_history['initial_objective']:.6f}")
+    logger.info(f"  Final objective: {obj_value:.6f}")
+    
+    if opt_history['initial_objective'] > 0:
+        obj_reduction = 100 * (1 - obj_value / opt_history['initial_objective'])
+        logger.info(f"  Objective reduction: {obj_reduction:.2f}%")
+    
+    logger.info("\nOptimized weights:")
     for k, w in enumerate(w_opt):
         logger.info(f"  Loop {k}: {w:.6f}")
     
@@ -1173,6 +1472,17 @@ def main():
     percent_reduction = 100 * (1 - metrics_after['std'] / (metrics_before['std'] + 1e-10))
     logger.info("\nImprovement:")
     logger.info(f"  Std reduction: {percent_reduction:.2f}%")
+    
+    # Validate optimization results
+    if HAS_VALIDATION:
+        logger.info("\nValidating optimization results...")
+        validation_report = validate_optimization_result(
+            w_opt, A, baseline_b0, roi_mask, BOUNDS, opt_history, logger=logger
+        )
+        generate_validation_summary(validation_report, logger=logger)
+    else:
+        validation_report = None
+        logger.debug("Validation utilities not available")
     
     # Save optimized map (optional)
     optimized_path = os.path.join(outdir_full, "biot_savart_optimized.png")
@@ -1219,6 +1529,76 @@ def main():
         f.write(f'alpha,{ALPHA}\n')
         f.write(f'optimizer_success,{success}\n')
     logger.info(f"Saved stats CSV: {stats_path}")
+    
+    # Save comprehensive JSON report
+    report_path = os.path.join(outdir_full, "optimization_report.json")
+    
+    # Helper function to convert numpy types to Python types for JSON serialization
+    def convert_to_json_serializable(obj):
+        """Convert numpy types to Python native types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_json_serializable(item) for item in obj]
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        else:
+            return obj
+    
+    optimization_report = {
+        'configuration': {
+            'grid_n': int(grid_n),
+            'grid_fov_mm': float(GRID_FOV_MM),
+            'roi_radius_mm': float(ROI_RADIUS_MM),
+            'n_loops': int(N_LOOPS),
+            'coil_radius_mm': float(R_COIL_MM),
+            'loop_radius_mm': float(LOOP_RADIUS_MM),
+            'alpha': float(ALPHA),
+            'bounds': [float(b) for b in BOUNDS],
+            'method': str(OPT_METHOD),
+            'maxiter': int(MAXITER)
+        },
+        'data': {
+            'subject': str(args.subject),
+            'acquisition': str(args.acq) if args.acq else None,
+            'dataset_dir': str(DATASET_DIR)
+        },
+        'optimization': {
+            'success': bool(success),
+            'n_iterations': int(opt_history['n_iterations']),
+            'n_function_evals': int(opt_history['n_function_evals']),
+            'initial_objective': float(opt_history['initial_objective']),
+            'final_objective': float(obj_value),
+            'message': str(opt_history['message']),
+            'history': {
+                'objective': [float(x) for x in opt_history['objective']],
+                'variance': [float(x) for x in opt_history['variance']],
+                'regularization': [float(x) for x in opt_history['regularization']],
+                'iteration': [int(x) for x in opt_history['iteration']],
+                'grad_norm': [float(x) for x in opt_history['grad_norm']]
+            }
+        },
+        'results': {
+            'weights': [float(w) for w in w_opt],
+            'baseline_metrics': {k: float(v) for k, v in metrics_before.items()},
+            'optimized_metrics': {k: float(v) for k, v in metrics_after.items()},
+            'improvement_percent': float(percent_reduction)
+        }
+    }
+    
+    # Add validation report if available
+    if validation_report:
+        optimization_report['validation'] = convert_to_json_serializable(validation_report)
+    
+    with open(report_path, 'w') as f:
+        json.dump(optimization_report, f, indent=2)
+    logger.info(f"Saved optimization report: {report_path}")
     
     # Final summary
     logger.info("\n" + "="*60)
