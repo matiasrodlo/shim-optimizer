@@ -1,0 +1,5 @@
+metric,value
+baseline_std,956.432740
+optimized_std,601.678582
+improvement_percent,37.09
+method,lsq_linear_bvls
