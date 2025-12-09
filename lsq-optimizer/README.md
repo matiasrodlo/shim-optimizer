@@ -73,23 +73,23 @@ bash run.sh --subject 01 --acq CP --verbose
 | **Method** | lsq_linear (BVLS) | L-BFGS-B |
 | **Optimality** | Global optimum | Local optimum |
 | **Speed** | Faster (specialized) | Slower (general) |
-| **Bounds** | (-5.0, 5.0) | (-1.0, 1.0) |
+| **Bounds** | (-1000.0, 1000.0) | (-1.0, 1.0) |
 | **Standard** | ✅ YES (literature) | General purpose |
-| **Expected Improvement** | 5-15% | 3-5% |
+| **Expected Improvement** | 30-40% | 3-5% |
 
 ## Configuration
 
 Edit values in `shim_optimizer_lsq.py`:
 
 ```python
-GRID_N = 200              # Grid resolution
+GRID_N = 300              # Grid resolution (high resolution)
 GRID_FOV_MM = 200.0       # Field of view (mm)
-N_LOOPS = 8               # Number of shim loops
-R_COIL_MM = 80.0          # Coil radius (mm)
+N_LOOPS = 32              # Number of shim loops (optimized)
+R_COIL_MM = 45.0          # Coil radius (mm) (optimized)
 LOOP_RADIUS_MM = 10.0     # Loop radius (mm)
 ROI_RADIUS_MM = 25.0      # ROI radius (mm)
-BOUNDS = (-5.0, 5.0)      # Weight bounds (larger than savart-optimizer!)
-ALPHA = 0.001             # Regularization parameter
+BOUNDS = (-1000.0, 1000.0)  # Weight bounds (essentially unconstrained)
+ALPHA = 0.0               # Regularization parameter (none for max performance)
 ```
 
 ## Output Files
